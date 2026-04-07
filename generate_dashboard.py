@@ -206,6 +206,7 @@ def generate_html(by_date: dict, by_model: dict, days: int, source_dir: str, dat
     @media (max-width: 768px) {{ .charts {{ grid-template-columns: 1fr; }} }}
     .chart-box {{ background: #1a1a24; border: 1px solid #2a2a38; border-radius: 12px;
                   padding: 20px; }}
+    .chart-wrap {{ position: relative; height: 320px; }}
     .chart-title {{ font-size: 0.9rem; font-weight: 600; color: #ccc;
                     margin-bottom: 16px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
@@ -247,11 +248,15 @@ def generate_html(by_date: dict, by_model: dict, days: int, source_dir: str, dat
   <div class="charts">
     <div class="chart-box">
       <div class="chart-title">Daily Token Usage</div>
-      <canvas id="dailyChart" height="220"></canvas>
+      <div class="chart-wrap">
+        <canvas id="dailyChart"></canvas>
+      </div>
     </div>
     <div class="chart-box">
       <div class="chart-title">By Model</div>
-      <canvas id="modelChart" height="220"></canvas>
+      <div class="chart-wrap">
+        <canvas id="modelChart"></canvas>
+      </div>
     </div>
   </div>
 
