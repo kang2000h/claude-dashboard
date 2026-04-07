@@ -1,7 +1,7 @@
 #!/bin/bash
-# Deploy Claude usage dashboard to GitHub Pages
+# Deploy Claude Code usage dashboard to GitHub Pages
 # Usage: ./deploy.sh [days]
-# Requires: ANTHROPIC_ADMIN_KEY env var, git repo with gh-pages or main branch
+# Requires: local Claude Code logs in ~/.claude, git repo with main branch configured for Pages
 
 set -e
 

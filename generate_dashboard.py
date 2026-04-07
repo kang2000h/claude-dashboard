@@ -1,54 +1,103 @@
 #!/usr/bin/env python3
 """
-Claude Usage Dashboard Generator
-Fetches token usage from Anthropic Admin API and generates a static HTML dashboard.
+Claude Code usage dashboard generator.
+Reads local Claude Code session logs and generates a static HTML dashboard.
 """
 
-import os
-import json
 import argparse
-import urllib.request
-import urllib.parse
-from datetime import datetime, timezone, timedelta
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
 
 
-ADMIN_API_KEY = os.environ.get("ANTHROPIC_ADMIN_KEY", "")
-API_BASE = "https://api.anthropic.com/v1"
-HEADERS = {
-    "anthropic-version": "2023-06-01",
-    "x-api-key": ADMIN_API_KEY,
-    "Content-Type": "application/json",
-}
+def parse_timestamp(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-def fetch_usage(days: int = 30) -> list[dict]:
-    """Fetch daily token usage for the past N days, grouped by model."""
-    ending_at = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    starting_at = ending_at - timedelta(days=days)
+def token_total(usage: dict) -> int:
+    return sum(
+        int(usage.get(key) or 0)
+        for key in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        )
+    )
 
-    params = {
-        "starting_at": starting_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "ending_at": ending_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "bucket_width": "1d",
-        "group_by[]": "model",
-        "limit": 200,
-    }
 
-    url = f"{API_BASE}/organizations/usage_report/messages?" + urllib.parse.urlencode(params, doseq=True)
-    req = urllib.request.Request(url, headers=HEADERS)
+def fetch_usage(days: int = 30, claude_dir: Optional[str] = None) -> list[dict]:
+    """Fetch usage from local Claude Code JSONL session logs."""
+    base_dir = Path(claude_dir or os.path.expanduser("~/.claude"))
+    projects_dir = base_dir / "projects"
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    if not projects_dir.exists():
+        raise FileNotFoundError(f"Claude projects directory not found: {projects_dir}")
+
+    latest_records: dict[tuple[str, str], tuple[datetime, dict]] = {}
+
+    for path in projects_dir.rglob("*.jsonl"):
+        try:
+            with path.open() as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    message = entry.get("message") or {}
+                    usage = message.get("usage") or {}
+                    session_id = entry.get("sessionId")
+                    message_id = message.get("id")
+                    timestamp = parse_timestamp(entry.get("timestamp", ""))
+                    model = message.get("model") or "unknown"
+
+                    if not usage or not session_id or not message_id or not timestamp:
+                        continue
+                    if timestamp < cutoff or model == "<synthetic>":
+                        continue
+                    if token_total(usage) <= 0:
+                        continue
+
+                    dedupe_key = (session_id, message_id)
+                    current = latest_records.get(dedupe_key)
+                    if current is None or timestamp > current[0] or (
+                        timestamp == current[0] and token_total(usage) > token_total(current[1]["usage"])
+                    ):
+                        latest_records[dedupe_key] = (
+                            timestamp,
+                            {
+                                "timestamp": timestamp,
+                                "model": model,
+                                "usage": usage,
+                            },
+                        )
+        except OSError:
+            continue
 
     results = []
-    while url:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-        results.extend(data.get("data", []))
-        if data.get("has_more") and data.get("next_page"):
-            params["page"] = data["next_page"]
-            url = f"{API_BASE}/organizations/usage_report/messages?" + urllib.parse.urlencode(params, doseq=True)
-        else:
-            url = None
+    for timestamp, record in latest_records.values():
+        usage = record["usage"]
+        results.append(
+            {
+                "start_time": timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "model": record["model"],
+                "uncached_input_tokens": int(usage.get("input_tokens") or 0),
+                "cached_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+            }
+        )
 
+    results.sort(key=lambda item: item["start_time"])
     return results
 
 
@@ -66,7 +115,7 @@ def aggregate(raw: list[dict]) -> tuple[dict, dict]:
         cache_write_t = entry.get("cache_creation_input_tokens", 0) or 0
         output_t = entry.get("output_tokens", 0) or 0
 
-        for bucket, key in [(by_date, date), (by_model, model)]:
+        for bucket, key in ((by_date, date), (by_model, model)):
             if key not in bucket:
                 bucket[key] = {"input": 0, "cached": 0, "cache_write": 0, "output": 0}
             bucket[key]["input"] += input_t
@@ -77,15 +126,15 @@ def aggregate(raw: list[dict]) -> tuple[dict, dict]:
     return dict(sorted(by_date.items())), by_model
 
 
-def fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.1f}K"
-    return str(n)
+def fmt_tokens(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
 
 
-def generate_html(by_date: dict, by_model: dict, days: int) -> str:
+def generate_html(by_date: dict, by_model: dict, days: int, source_dir: str, data_points: int) -> str:
     dates = list(by_date.keys())
     input_series = [by_date[d]["input"] for d in dates]
     cached_series = [by_date[d]["cached"] for d in dates]
@@ -98,36 +147,35 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
 
     model_labels = list(by_model.keys())
     model_totals = [
-        v["input"] + v["cached"] + v["cache_write"] + v["output"]
-        for v in by_model.values()
+        values["input"] + values["cached"] + values["cache_write"] + values["output"]
+        for values in by_model.values()
     ]
 
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Table rows
     table_rows = ""
-    for d in reversed(dates):
-        v = by_date[d]
-        total_day = v["input"] + v["cached"] + v["cache_write"] + v["output"]
+    for day in reversed(dates):
+        values = by_date[day]
+        total_day = values["input"] + values["cached"] + values["cache_write"] + values["output"]
         table_rows += f"""
         <tr>
-          <td>{d}</td>
-          <td>{fmt_tokens(v['input'])}</td>
-          <td>{fmt_tokens(v['cached'])}</td>
-          <td>{fmt_tokens(v['cache_write'])}</td>
-          <td>{fmt_tokens(v['output'])}</td>
+          <td>{day}</td>
+          <td>{fmt_tokens(values['input'])}</td>
+          <td>{fmt_tokens(values['cached'])}</td>
+          <td>{fmt_tokens(values['cache_write'])}</td>
+          <td>{fmt_tokens(values['output'])}</td>
           <td><strong>{fmt_tokens(total_day)}</strong></td>
         </tr>"""
 
     model_rows = ""
-    for m, v in sorted(by_model.items(), key=lambda x: -(sum(x[1].values()))):
-        total_m = sum(v.values())
+    for model, values in sorted(by_model.items(), key=lambda item: -(sum(item[1].values()))):
+        total_model = sum(values.values())
         model_rows += f"""
         <tr>
-          <td>{m}</td>
-          <td>{fmt_tokens(v['input'])}</td>
-          <td>{fmt_tokens(v['output'])}</td>
-          <td><strong>{fmt_tokens(total_m)}</strong></td>
+          <td>{model}</td>
+          <td>{fmt_tokens(values['input'])}</td>
+          <td>{fmt_tokens(values['output'])}</td>
+          <td><strong>{fmt_tokens(total_model)}</strong></td>
         </tr>"""
 
     return f"""<!DOCTYPE html>
@@ -135,7 +183,7 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Claude Usage Dashboard</title>
+  <title>Claude Code Usage Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -174,8 +222,8 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
   </style>
 </head>
 <body>
-  <h1>Claude Usage Dashboard <span class="badge">Last {days} days</span></h1>
-  <div class="subtitle">Updated: {updated_at} &nbsp;·&nbsp; All workspaces &nbsp;·&nbsp; All models</div>
+  <h1>Claude Code Usage Dashboard <span class="badge">Last {days} days</span></h1>
+  <div class="subtitle">Updated: {updated_at} &nbsp;·&nbsp; Source: local Claude Code logs &nbsp;·&nbsp; Messages: {data_points}</div>
 
   <div class="cards">
     <div class="card">
@@ -192,7 +240,7 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
     </div>
     <div class="card">
       <div class="card-label">Active Days</div>
-      <div class="card-value orange">{sum(1 for d in by_date.values() if sum(d.values()) > 0)}</div>
+      <div class="card-value orange">{sum(1 for day in by_date.values() if sum(day.values()) > 0)}</div>
     </div>
   </div>
 
@@ -230,6 +278,17 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
     </table>
   </div>
 
+  <div class="table-box">
+    <div class="section-title">Data Source</div>
+    <table>
+      <tbody>
+        <tr><td>Claude directory</td><td>{source_dir}</td></tr>
+        <tr><td>Scope</td><td>Local Claude Code sessions found on this machine</td></tr>
+        <tr><td>Limitation</td><td>Does not include usage from other devices or non-CLI surfaces</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <script>
     const COLORS = ['#60a5fa','#34d399','#a78bfa','#fb923c','#f472b6','#facc15','#38bdf8'];
 
@@ -241,7 +300,7 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
           {{ label: 'Input', data: {json.dumps(input_series)}, backgroundColor: '#60a5fa88', borderColor: '#60a5fa', borderWidth: 1 }},
           {{ label: 'Cache Hit', data: {json.dumps(cached_series)}, backgroundColor: '#34d39988', borderColor: '#34d399', borderWidth: 1 }},
           {{ label: 'Cache Write', data: {json.dumps(cache_write_series)}, backgroundColor: '#a78bfa88', borderColor: '#a78bfa', borderWidth: 1 }},
-          {{ label: 'Output', data: {json.dumps(output_series)}, backgroundColor: '#fb923c88', borderColor: '#fb923c', borderWidth: 1 }},
+          {{ label: 'Output', data: {json.dumps(output_series)}, backgroundColor: '#fb923c88', borderColor: '#fb923c', borderWidth: 1 }}
         ]
       }},
       options: {{
@@ -273,24 +332,25 @@ def generate_html(by_date: dict, by_model: dict, days: int) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Claude usage dashboard")
+    parser = argparse.ArgumentParser(description="Generate Claude Code usage dashboard")
     parser.add_argument("--days", type=int, default=30, help="Number of days to look back")
     parser.add_argument("--output", default="index.html", help="Output HTML file path")
+    parser.add_argument(
+        "--claude-dir",
+        default=os.path.expanduser("~/.claude"),
+        help="Base directory for Claude Code local data",
+    )
     args = parser.parse_args()
 
-    if not ADMIN_API_KEY:
-        print("Error: Set ANTHROPIC_ADMIN_KEY environment variable")
-        raise SystemExit(1)
-
-    print(f"Fetching {args.days} days of usage data...")
-    raw = fetch_usage(args.days)
-    print(f"  Got {len(raw)} data points")
+    print(f"Reading {args.days} days of local Claude Code usage...")
+    raw = fetch_usage(args.days, args.claude_dir)
+    print(f"  Got {len(raw)} message records")
 
     by_date, by_model = aggregate(raw)
-    html = generate_html(by_date, by_model, args.days)
+    html = generate_html(by_date, by_model, args.days, args.claude_dir, len(raw))
 
-    with open(args.output, "w") as f:
-        f.write(html)
+    with open(args.output, "w") as handle:
+        handle.write(html)
     print(f"Dashboard written to: {args.output}")
 
 
